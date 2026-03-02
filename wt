@@ -80,7 +80,9 @@ symlink_dotfiles() {
     count=$((count + 1))
   done
 
-  [[ "$count" -gt 0 ]] && printf '  %sSymlinked %d dotfile(s)%s\n' "$DIM" "$count" "$NC"
+  if [[ "$count" -gt 0 ]]; then
+    printf '  %sSymlinked %d dotfile(s)%s\n' "$DIM" "$count" "$NC"
+  fi
 }
 
 # --- Commands ---
