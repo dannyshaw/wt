@@ -40,9 +40,12 @@ fi
 
 # --- Helpers ---
 
-die()     { printf '%serror:%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
-info()    { printf '%s=>%s %s\n' "$CYAN" "$NC" "$*"; }
-warn()    { printf '%swarning:%s %s\n' "$YELLOW" "$NC" "$*"; }
+die() {
+  printf '%serror:%s %s\n' "$RED" "$NC" "$*" >&2
+  exit 1
+}
+info() { printf '%s=>%s %s\n' "$CYAN" "$NC" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$YELLOW" "$NC" "$*"; }
 success() { printf '%sdone:%s %s\n' "$GREEN" "$NC" "$*"; }
 
 require_repo() {
@@ -60,8 +63,8 @@ symlink_dotfiles() {
     base="$(basename "$item")"
 
     case "$base" in
-      .|..|.git|.DS_Store) continue ;;
-      *cache*)             continue ;;
+      . | .. | .git | .DS_Store) continue ;;
+      *cache*) continue ;;
     esac
 
     # Skip git-tracked files
@@ -92,7 +95,7 @@ cmd_new() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -h|--help)
+      -h | --help)
         cat <<EOF
 Usage: wt new <branch> [folder-name]
 
@@ -178,7 +181,7 @@ cmd_rm() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -h|--help)
+      -h | --help)
         cat <<EOF
 Usage: wt rm <name>
 
@@ -233,7 +236,7 @@ cmd_mv() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -h|--help)
+      -h | --help)
         cat <<EOF
 Usage: wt mv <existing-worktree-path> [folder-name]
 
@@ -292,7 +295,7 @@ cmd_path() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -h|--help)
+      -h | --help)
         cat <<EOF
 Usage: wt path <name>
 
@@ -424,7 +427,7 @@ cmd_shell() {
   local shell_name="${1:-}"
 
   case "$shell_name" in
-    -h|--help)
+    -h | --help)
       cat <<EOF
 Usage: eval "\$(wt shell zsh)" or eval "\$(wt shell bash)"
 
@@ -436,9 +439,9 @@ Add to your rc file:
 EOF
       return 0
       ;;
-    zsh)  _shell_zsh ;;
+    zsh) _shell_zsh ;;
     bash) _shell_bash ;;
-    *)    die "specify a shell: wt shell zsh  or  wt shell bash" ;;
+    *) die "specify a shell: wt shell zsh  or  wt shell bash" ;;
   esac
 }
 
@@ -651,14 +654,32 @@ EOF
 # --- Main ---
 
 case "${1:---help}" in
-  new)           shift; cmd_new "$@" ;;
-  rm)            shift; cmd_rm "$@" ;;
-  mv)            shift; cmd_mv "$@" ;;
-  cd)            die "'wt cd' requires shell integration. Run: wt shell --help" ;;
-  path)          shift; cmd_path "$@" ;;
-  ls)            shift; cmd_ls "$@" ;;
-  shell|--shell) shift; cmd_shell "$@" ;;
-  --version|-V)  echo "wt $VERSION" ;;
-  help|-h|--help) cmd_help ;;
-  *)             die "unknown command: $1. Run 'wt help' for usage." ;;
+  new)
+    shift
+    cmd_new "$@"
+    ;;
+  rm)
+    shift
+    cmd_rm "$@"
+    ;;
+  mv)
+    shift
+    cmd_mv "$@"
+    ;;
+  cd) die "'wt cd' requires shell integration. Run: wt shell --help" ;;
+  path)
+    shift
+    cmd_path "$@"
+    ;;
+  ls)
+    shift
+    cmd_ls "$@"
+    ;;
+  shell | --shell)
+    shift
+    cmd_shell "$@"
+    ;;
+  --version | -V) echo "wt $VERSION" ;;
+  help | -h | --help) cmd_help ;;
+  *) die "unknown command: $1. Run 'wt help' for usage." ;;
 esac
