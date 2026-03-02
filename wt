@@ -1,0 +1,662 @@
+#!/usr/bin/env bash
+# wt - git worktree manager for organised branch workflows
+# https://github.com/dannyshaw/wt
+set -euo pipefail
+
+VERSION="0.2.0"
+
+# --- Config ---
+
+WT_REPO="${WT_REPO:-}"
+WT_TREES="${WT_TREES:-}"
+WT_MAX="${WT_MAX:-15}"
+
+# Auto-detect repo root if not set
+if [[ -z "$WT_REPO" ]]; then
+  WT_REPO="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+fi
+
+# Default trees dir to sibling of repo
+if [[ -z "$WT_TREES" ]]; then
+  if [[ -n "$WT_REPO" ]]; then
+    WT_TREES="$(dirname "$WT_REPO")/trees"
+  fi
+fi
+
+# --- Colours (disabled if not a terminal) ---
+
+if [[ -t 1 ]]; then
+  RED=$'\033[0;31m'
+  GREEN=$'\033[0;32m'
+  YELLOW=$'\033[0;33m'
+  CYAN=$'\033[0;36m'
+  MAGENTA=$'\033[0;35m'
+  BOLD=$'\033[1m'
+  DIM=$'\033[2m'
+  NC=$'\033[0m'
+else
+  RED='' GREEN='' YELLOW='' CYAN='' MAGENTA='' BOLD='' DIM='' NC=''
+fi
+
+# --- Helpers ---
+
+die()     { printf '%serror:%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
+info()    { printf '%s=>%s %s\n' "$CYAN" "$NC" "$*"; }
+warn()    { printf '%swarning:%s %s\n' "$YELLOW" "$NC" "$*"; }
+success() { printf '%sdone:%s %s\n' "$GREEN" "$NC" "$*"; }
+
+require_repo() {
+  [[ -n "$WT_REPO" ]] || die "not in a git repo and WT_REPO is not set"
+  [[ -d "$WT_REPO/.git" || -f "$WT_REPO/.git" ]] || die "not a git repository: $WT_REPO"
+  [[ -n "$WT_TREES" ]] || die "WT_TREES is not set"
+}
+
+symlink_dotfiles() {
+  local src="$1" dest="$2" count=0
+
+  for item in "$src"/.*; do
+    [[ -e "$item" ]] || continue
+    local base
+    base="$(basename "$item")"
+
+    case "$base" in
+      .|..|.git|.DS_Store) continue ;;
+      *cache*)             continue ;;
+    esac
+
+    # Skip git-tracked files
+    if [[ -f "$item" ]]; then
+      git -C "$src" ls-files --error-unmatch "$base" &>/dev/null && continue
+    elif [[ -d "$item" ]]; then
+      local tracked
+      tracked="$(git -C "$src" ls-files "$base/" 2>/dev/null | head -1)"
+      [[ -n "$tracked" ]] && continue
+    fi
+
+    # Don't overwrite
+    [[ -e "$dest/$base" ]] && continue
+
+    ln -sf "$item" "$dest/$base"
+    count=$((count + 1))
+  done
+
+  [[ "$count" -gt 0 ]] && printf '  %sSymlinked %d dotfile(s)%s\n' "$DIM" "$count" "$NC"
+}
+
+# --- Commands ---
+
+cmd_new() {
+  local branch="" name=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        cat <<EOF
+Usage: wt new <branch> [folder-name]
+
+Create a new worktree in \$WT_TREES/.
+
+If the branch exists locally or on origin, checks it out.
+If already checked out in another worktree, offers to move it.
+Otherwise creates a new branch from origin/master.
+
+Folder name defaults to the last segment of the branch name.
+
+Examples:
+  wt new danny/my-feature        # creates trees/my-feature/
+  wt new danny/my-feature myf    # creates trees/myf/
+EOF
+        return 0
+        ;;
+      *) [[ -z "$branch" ]] && branch="$1" || name="$1" ;;
+    esac
+    shift
+  done
+
+  [[ -z "$branch" ]] && die "branch name required. See: wt new --help"
+
+  require_repo
+  name="${name:-${branch##*/}}"
+  local dest="$WT_TREES/$name"
+
+  # Check worktree limit
+  if [[ -d "$WT_TREES" ]]; then
+    local count
+    count="$(find "$WT_TREES" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "$count" -ge "$WT_MAX" ]]; then
+      die "already at $count worktrees (max $WT_MAX). Remove one first."
+    fi
+  fi
+
+  [[ -d "$dest" ]] && die "folder already exists: $dest"
+
+  mkdir -p "$WT_TREES"
+  cd "$WT_REPO" || exit 1
+
+  # Check if branch is already checked out in another worktree
+  local existing_wt
+  existing_wt="$(git worktree list --porcelain 2>/dev/null | awk -v b="$branch" '
+    /^worktree / { wt=$2 }
+    /^branch /   { gsub("refs/heads/", "", $2); if ($2 == b) print wt }
+  ')"
+
+  if [[ -n "$existing_wt" ]]; then
+    warn "branch '$branch' is already checked out at: $existing_wt"
+    printf 'Move it to %s? [y/N] ' "$dest"
+    read -r confirm
+    if [[ "$confirm" == "y" ]]; then
+      cmd_mv "$existing_wt" "$name"
+      return
+    else
+      return 1
+    fi
+  fi
+
+  # Try existing branch, otherwise create from origin/master
+  if git show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+    info "Checking out existing local branch: $branch"
+    git worktree add "$dest" "$branch"
+  elif git show-ref --verify --quiet "refs/remotes/origin/$branch" 2>/dev/null; then
+    info "Checking out remote branch: origin/$branch"
+    git worktree add "$dest" "$branch"
+  else
+    info "Creating new branch from origin/master: $branch"
+    git fetch origin master --quiet
+    git worktree add -b "$branch" "$dest" origin/master
+  fi
+
+  symlink_dotfiles "$WT_REPO" "$dest"
+  printf '\n'
+  success "$dest"
+  printf '  cd %s\n' "$dest"
+}
+
+cmd_rm() {
+  local name=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        cat <<EOF
+Usage: wt rm <name>
+
+Remove a worktree from \$WT_TREES/.
+Warns about uncommitted changes. Optionally deletes the branch.
+
+Examples:
+  wt rm my-feature
+EOF
+        return 0
+        ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+
+  [[ -z "$name" ]] && die "name required. See: wt rm --help"
+
+  require_repo
+  local dest="$WT_TREES/$name"
+  [[ -d "$dest" ]] || die "no worktree at: $dest"
+
+  cd "$WT_REPO" || exit 1
+
+  local branch
+  branch="$(git -C "$dest" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+
+  # Check for uncommitted changes
+  local changes
+  changes="$(git -C "$dest" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "$changes" -gt 0 ]]; then
+    warn "$changes uncommitted change(s) in $dest"
+    printf 'Remove anyway? [y/N] '
+    read -r confirm
+    [[ "$confirm" != "y" ]] && return 1
+  fi
+
+  git worktree remove "$dest" --force
+  success "removed worktree: $name"
+
+  if [[ -n "$branch" && "$branch" != "HEAD" ]]; then
+    printf "Also delete branch '%s'? [y/N] " "$branch"
+    read -r confirm
+    if [[ "$confirm" == "y" ]]; then
+      git branch -D "$branch" 2>/dev/null && success "deleted branch: $branch"
+    fi
+  fi
+}
+
+cmd_mv() {
+  local old_path="" name=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        cat <<EOF
+Usage: wt mv <existing-worktree-path> [folder-name]
+
+Move an existing worktree into \$WT_TREES/.
+Preserves uncommitted changes. Folder name defaults to branch name.
+
+Examples:
+  wt mv ~/dev/edrolo/my-feature
+  wt mv ~/dev/edrolo/my-feature renamed
+EOF
+        return 0
+        ;;
+      *) [[ -z "$old_path" ]] && old_path="$1" || name="$1" ;;
+    esac
+    shift
+  done
+
+  [[ -z "$old_path" ]] && die "path required. See: wt mv --help"
+
+  require_repo
+  old_path="$(cd "$old_path" 2>/dev/null && pwd)" || die "path does not exist: $old_path"
+
+  local repo_abs
+  repo_abs="$(cd "$WT_REPO" 2>/dev/null && pwd)"
+  [[ "$old_path" == "$repo_abs" ]] && die "can't move the main repo."
+
+  local branch
+  branch="$(git -C "$old_path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [[ -z "$branch" || "$branch" == "HEAD" ]] && die "can't determine branch at: $old_path"
+
+  name="${name:-${branch##*/}}"
+  local dest="$WT_TREES/$name"
+
+  [[ -d "$dest" ]] && die "destination already exists: $dest"
+
+  local changes
+  changes="$(git -C "$old_path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+  [[ "$changes" -gt 0 ]] && printf '  %s%d uncommitted change(s) will be preserved%s\n' "$DIM" "$changes" "$NC"
+
+  mkdir -p "$WT_TREES"
+  cd "$WT_REPO" || exit 1
+
+  info "Moving: $branch"
+  printf '  From: %s\n' "$old_path"
+  printf '  To:   %s\n' "$dest"
+  git worktree move "$old_path" "$dest"
+
+  symlink_dotfiles "$WT_REPO" "$dest"
+  printf '\n'
+  success "$dest"
+  printf '  cd %s\n' "$dest"
+}
+
+cmd_path() {
+  local name=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        cat <<EOF
+Usage: wt path <name>
+
+Print the full path to a worktree. Supports fuzzy matching.
+
+Examples:
+  cd "\$(wt path django)"
+EOF
+        return 0
+        ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+
+  [[ -z "$name" ]] && die "name required. See: wt path --help"
+
+  require_repo
+  local dest="$WT_TREES/$name"
+  if [[ -d "$dest" ]]; then
+    printf '%s\n' "$dest"
+  else
+    local match
+    match="$(find "$WT_TREES" -mindepth 1 -maxdepth 1 -type d -name "*${name}*" 2>/dev/null | head -1)"
+    if [[ -n "$match" ]]; then
+      printf '%s\n' "$match"
+    else
+      die "no worktree matching: $name"
+    fi
+  fi
+}
+
+cmd_ls() {
+  local days="${1:-14}"
+
+  require_repo
+  cd "$WT_REPO" || exit 1
+
+  # Collect worktree branches
+  local wt_branches
+  wt_branches="$(git worktree list 2>/dev/null | awk '{gsub(/\[|\]/, "", $3); print $3}')"
+
+  printf '%sWORKTREES%s\n\n' "$BOLD" "$NC"
+
+  git worktree list 2>/dev/null | while IFS= read -r line; do
+    local path branch ahead behind
+    path="$(echo "$line" | awk '{print $1}')"
+    branch="$(echo "$line" | awk '{print $3}' | tr -d '[]')"
+
+    ahead="$(git rev-list --count "origin/master..$branch" 2>/dev/null || echo '?')"
+    behind="$(git rev-list --count "$branch..origin/master" 2>/dev/null || echo '?')"
+
+    local ahead_str behind_str
+    ahead_str="${GREEN}+${ahead}${NC}"
+    if [[ "$behind" =~ ^[0-9]+$ ]] && [[ "$behind" -gt 0 ]]; then
+      behind_str="${RED}-${behind}${NC}"
+    else
+      behind_str="${DIM}-${behind}${NC}"
+    fi
+
+    # Uncommitted changes
+    local dirty=""
+    if [[ -d "$path" ]]; then
+      local changes
+      changes="$(git -C "$path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+      [[ "$changes" -gt 0 ]] && dirty=" ${YELLOW}(${changes} uncommitted)${NC}"
+    fi
+
+    # Unpushed commits
+    local unpushed=""
+    if git rev-parse --verify "origin/$branch" &>/dev/null; then
+      local unpushed_count
+      unpushed_count="$(git rev-list --count "origin/$branch..$branch" 2>/dev/null || echo 0)"
+      [[ "$unpushed_count" -gt 0 ]] && unpushed=" ${MAGENTA}(${unpushed_count} unpushed)${NC}"
+    else
+      if [[ "$ahead" =~ ^[0-9]+$ ]] && [[ "$ahead" -gt 0 ]]; then
+        unpushed=" ${RED}(no remote)${NC}"
+      fi
+    fi
+
+    local short_path="${path/#$HOME/~}"
+
+    printf "  ${BOLD}${CYAN}%-42s${NC} %b/%b%b%b\n" "$branch" "$ahead_str" "$behind_str" "$dirty" "$unpushed"
+    printf "  ${DIM}%s${NC}\n" "$short_path"
+  done
+
+  printf '\n%sRECENT BRANCHES%s %s(not in a worktree, last %sd)%s\n\n' "$BOLD" "$NC" "$DIM" "$days" "$NC"
+
+  git branch --sort=-committerdate --format='%(committerdate:short) %(refname:short)' | while read -r date branch; do
+    # Skip if older than cutoff
+    local cutoff
+    cutoff="$(date -v-"${days}d" +%Y-%m-%d 2>/dev/null || date -d "${days} days ago" +%Y-%m-%d 2>/dev/null)"
+    [[ "$date" < "$cutoff" ]] && continue
+
+    # Skip worktree branches and master
+    echo "$wt_branches" | grep -qx "$branch" && continue
+    [[ "$branch" == "master" || "$branch" == "main" ]] && continue
+
+    local ahead behind
+    ahead="$(git rev-list --count "origin/master..$branch" 2>/dev/null || echo '?')"
+    behind="$(git rev-list --count "$branch..origin/master" 2>/dev/null || echo '?')"
+
+    local ahead_str behind_str
+    ahead_str="${GREEN}+${ahead}${NC}"
+    if [[ "$behind" =~ ^[0-9]+$ ]] && [[ "$behind" -gt 0 ]]; then
+      behind_str="${RED}-${behind}${NC}"
+    else
+      behind_str="${DIM}-${behind}${NC}"
+    fi
+
+    local remote_str=""
+    if git rev-parse --verify "origin/$branch" &>/dev/null; then
+      local unpushed_count
+      unpushed_count="$(git rev-list --count "origin/$branch..$branch" 2>/dev/null || echo 0)"
+      if [[ "$unpushed_count" -gt 0 ]]; then
+        remote_str="${MAGENTA}pushed${NC} ${YELLOW}(${unpushed_count} unpushed)${NC}"
+      else
+        remote_str="${MAGENTA}pushed${NC}"
+      fi
+    else
+      remote_str="${RED}local only${NC}"
+    fi
+
+    printf "  ${DIM}%s${NC}  ${BOLD}%-42s${NC} %b/%b  [%b]\n" "$date" "$branch" "$ahead_str" "$behind_str" "$remote_str"
+  done
+}
+
+cmd_shell() {
+  local shell_name="${1:-}"
+
+  case "$shell_name" in
+    -h|--help)
+      cat <<EOF
+Usage: eval "\$(wt shell zsh)" or eval "\$(wt shell bash)"
+
+Enables 'wt cd' and tab completions in your current shell.
+
+Add to your rc file:
+  zsh:  eval "\$(wt shell zsh)"
+  bash: eval "\$(wt shell bash)"
+EOF
+      return 0
+      ;;
+    zsh)  _shell_zsh ;;
+    bash) _shell_bash ;;
+    *)    die "specify a shell: wt shell zsh  or  wt shell bash" ;;
+  esac
+}
+
+_shell_zsh() {
+  cat <<'ZSHEOF'
+# wt shell integration (zsh) — generated by `wt shell zsh`
+wt() {
+  case "${1:-}" in
+    cd)
+      shift
+      local name="${1:-}"
+      local trees="${WT_TREES:-}"
+      if [[ -z "$trees" ]]; then
+        local repo
+        repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+        [[ -n "$repo" ]] && trees="$(dirname "$repo")/trees"
+      fi
+      [[ -z "$trees" ]] && { echo "error: can't determine WT_TREES" >&2; return 1; }
+
+      if [[ -z "$name" ]]; then
+        echo "Usage: wt cd <name>"
+        echo ""
+        echo "Available worktrees:"
+        command ls -1 "$trees" 2>/dev/null | sed 's/^/  /'
+        return 1
+      fi
+
+      local dest="$trees/$name"
+      if [[ -d "$dest" ]]; then
+        builtin cd "$dest" || return
+        return
+      fi
+
+      local match
+      match="$(find "$trees" -mindepth 1 -maxdepth 1 -type d -name "*${name}*" 2>/dev/null | head -1)"
+      if [[ -n "$match" ]]; then
+        builtin cd "$match" || return
+      else
+        echo "No worktree matching: $name" >&2
+        return 1
+      fi
+      ;;
+    *) command wt "$@" ;;
+  esac
+}
+
+_wt() {
+  local -a commands
+  commands=(
+    'new:Create a new worktree'
+    'rm:Remove a worktree'
+    'mv:Move an existing worktree'
+    'cd:Change directory to a worktree'
+    'path:Print worktree path'
+    'ls:List worktrees and recent branches'
+    'shell:Print shell integration code'
+    'help:Show help'
+  )
+  _arguments -C '1:command:->cmd' '*:arg:->args'
+  case "$state" in
+    cmd) _describe 'command' commands ;;
+    args)
+      local trees="${WT_TREES:-}"
+      if [[ -z "$trees" ]]; then
+        local repo
+        repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+        [[ -n "$repo" ]] && trees="$(dirname "$repo")/trees"
+      fi
+      case "${words[2]}" in
+        cd|rm|path)
+          local -a treelist
+          if [[ -n "$trees" && -d "$trees" ]]; then
+            treelist=(${(f)"$(command ls -1 "$trees" 2>/dev/null)"})
+          fi
+          _describe 'worktree' treelist
+          ;;
+        new)
+          local repo="${WT_REPO:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
+          local -a branches
+          if [[ -n "$repo" ]]; then
+            branches=(${(f)"$(git -C "$repo" branch --format='%(refname:short)' 2>/dev/null)"})
+          fi
+          _describe 'branch' branches
+          ;;
+        mv) _files -/ ;;
+      esac
+      ;;
+  esac
+}
+compdef _wt wt
+ZSHEOF
+}
+
+_shell_bash() {
+  cat <<'BASHEOF'
+# wt shell integration (bash) — generated by `wt shell bash`
+wt() {
+  case "${1:-}" in
+    cd)
+      shift
+      local name="${1:-}"
+      local trees="${WT_TREES:-}"
+      if [[ -z "$trees" ]]; then
+        local repo
+        repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+        [[ -n "$repo" ]] && trees="$(dirname "$repo")/trees"
+      fi
+      [[ -z "$trees" ]] && { echo "error: can't determine WT_TREES" >&2; return 1; }
+
+      if [[ -z "$name" ]]; then
+        echo "Usage: wt cd <name>"
+        echo ""
+        echo "Available worktrees:"
+        command ls -1 "$trees" 2>/dev/null | sed 's/^/  /'
+        return 1
+      fi
+
+      local dest="$trees/$name"
+      if [[ -d "$dest" ]]; then
+        builtin cd "$dest" || return
+        return
+      fi
+
+      local match
+      match="$(find "$trees" -mindepth 1 -maxdepth 1 -type d -name "*${name}*" 2>/dev/null | head -1)"
+      if [[ -n "$match" ]]; then
+        builtin cd "$match" || return
+      else
+        echo "No worktree matching: $name" >&2
+        return 1
+      fi
+      ;;
+    *) command wt "$@" ;;
+  esac
+}
+
+_wt_completions() {
+  local cur prev commands
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  commands="new rm mv cd path ls shell help"
+
+  if [[ ${COMP_CWORD} -eq 1 ]]; then
+    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+    return
+  fi
+
+  local trees="${WT_TREES:-}"
+  if [[ -z "$trees" ]]; then
+    local repo
+    repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    [[ -n "$repo" ]] && trees="$(dirname "$repo")/trees"
+  fi
+
+  case "${COMP_WORDS[1]}" in
+    cd|rm|path)
+      if [[ -n "$trees" && -d "$trees" ]]; then
+        COMPREPLY=($(compgen -W "$(command ls -1 "$trees" 2>/dev/null)" -- "$cur"))
+      fi
+      ;;
+    new)
+      local repo="${WT_REPO:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
+      if [[ -n "$repo" ]]; then
+        COMPREPLY=($(compgen -W "$(git -C "$repo" branch --format='%(refname:short)' 2>/dev/null)" -- "$cur"))
+      fi
+      ;;
+    mv)
+      COMPREPLY=($(compgen -d -- "$cur"))
+      ;;
+    shell)
+      COMPREPLY=($(compgen -W "zsh bash" -- "$cur"))
+      ;;
+  esac
+}
+complete -F _wt_completions wt
+BASHEOF
+}
+
+cmd_help() {
+  cat <<EOF
+${BOLD}wt${NC} — git worktree manager ${DIM}v${VERSION}${NC}
+
+${BOLD}Usage:${NC} wt <command> [args]
+
+${BOLD}Commands:${NC}
+  new <branch> [name]    Create a worktree (or move if already checked out)
+  rm <name>              Remove a worktree (prompts for branch deletion)
+  mv <path> [name]       Move an existing worktree into trees/
+  cd <name>              Change directory to a worktree (needs shell integration)
+  ls [days]              List worktrees and recent branches (default: 14d)
+  path <name>            Print worktree path (supports fuzzy match)
+  shell <zsh|bash>       Print shell integration code
+  help                   Show this help
+
+${BOLD}Shell integration:${NC}
+  zsh:  eval "\$(wt shell zsh)"
+  bash: eval "\$(wt shell bash)"
+
+  Enables 'wt cd' with fuzzy matching and tab completions.
+
+${BOLD}Config (env vars):${NC}
+  WT_REPO    Main bare/checkout repo  (auto-detected from git)
+  WT_TREES   Worktree directory       (default: sibling 'trees/' dir)
+  WT_MAX     Max worktrees            (default: 15)
+
+Run 'wt <command> --help' for command-specific help.
+EOF
+}
+
+# --- Main ---
+
+case "${1:---help}" in
+  new)           shift; cmd_new "$@" ;;
+  rm)            shift; cmd_rm "$@" ;;
+  mv)            shift; cmd_mv "$@" ;;
+  cd)            die "'wt cd' requires shell integration. Run: wt shell --help" ;;
+  path)          shift; cmd_path "$@" ;;
+  ls)            shift; cmd_ls "$@" ;;
+  shell|--shell) shift; cmd_shell "$@" ;;
+  --version|-V)  echo "wt $VERSION" ;;
+  help|-h|--help) cmd_help ;;
+  *)             die "unknown command: $1. Run 'wt help' for usage." ;;
+esac
