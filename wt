@@ -9,6 +9,7 @@ VERSION="0.2.0"
 
 WT_REPO="${WT_REPO:-}"
 WT_TREES="${WT_TREES:-}"
+_WT_TREES_FROM_ENV="$WT_TREES"
 WT_MAX="${WT_MAX:-15}"
 
 # Auto-detect repo root if not set
@@ -88,6 +89,204 @@ symlink_dotfiles() {
   fi
 }
 
+# --- Config file (wt.yml) ---
+
+_WT_CONFIG_LOADED=0
+_PC_TYPES=()
+_PC_VALUES=()
+_PC_DIRS=()
+
+load_config() {
+  local config="$WT_REPO/wt.yml"
+  _WT_CONFIG_LOADED=0
+  _PC_TYPES=()
+  _PC_VALUES=()
+  _PC_DIRS=()
+
+  [[ -f "$config" ]] || return 0
+  _WT_CONFIG_LOADED=1
+
+  local in_post_create=0
+  local last_index=-1
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Strip comments and skip blanks
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+
+    # Top-level trees: key
+    if [[ "$line" =~ ^trees:[[:space:]]*(.+)$ ]]; then
+      local trees_val="${BASH_REMATCH[1]}"
+      trees_val="${trees_val%%#*}"                           # strip inline comment
+      trees_val="${trees_val%"${trees_val##*[![:space:]]}"}" # trim trailing
+      if [[ -z "$_WT_TREES_FROM_ENV" ]]; then
+        # Resolve relative to repo
+        if [[ "$trees_val" != /* ]]; then
+          WT_TREES="$(cd "$WT_REPO" && cd "$trees_val" 2>/dev/null && pwd || echo "$WT_REPO/$trees_val")"
+        else
+          WT_TREES="$trees_val"
+        fi
+      fi
+      in_post_create=0
+      continue
+    fi
+
+    # post_create: header
+    if [[ "$line" =~ ^post_create: ]]; then
+      in_post_create=1
+      continue
+    fi
+
+    # Any other top-level key ends post_create
+    if [[ "$line" =~ ^[a-zA-Z_] ]]; then
+      in_post_create=0
+      continue
+    fi
+
+    # Inside post_create: list items
+    if [[ "$in_post_create" -eq 1 ]]; then
+      # dir: sub-property (indented more than list item)
+      if [[ "$line" =~ ^[[:space:]]+dir:[[:space:]]*(.+)$ ]]; then
+        local dir_val="${BASH_REMATCH[1]}"
+        dir_val="${dir_val%%#*}"
+        dir_val="${dir_val%"${dir_val##*[![:space:]]}"}"
+        if [[ "$last_index" -ge 0 ]]; then
+          _PC_DIRS[last_index]="$dir_val"
+        fi
+        continue
+      fi
+
+      if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*symlink:[[:space:]]*(.+)$ ]]; then
+        local val="${BASH_REMATCH[1]}"
+        val="${val%%#*}"
+        val="${val%"${val##*[![:space:]]}"}"
+        _PC_TYPES+=("symlink")
+        _PC_VALUES+=("$val")
+        _PC_DIRS+=("")
+        last_index=$((${#_PC_TYPES[@]} - 1))
+        continue
+      fi
+
+      if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*copy:[[:space:]]*(.+)$ ]]; then
+        local val="${BASH_REMATCH[1]}"
+        val="${val%%#*}"
+        val="${val%"${val##*[![:space:]]}"}"
+        _PC_TYPES+=("copy")
+        _PC_VALUES+=("$val")
+        _PC_DIRS+=("")
+        last_index=$((${#_PC_TYPES[@]} - 1))
+        continue
+      fi
+
+      if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*run:[[:space:]]*(.+)$ ]]; then
+        local val="${BASH_REMATCH[1]}"
+        val="${val%%#*}"
+        val="${val%"${val##*[![:space:]]}"}"
+        _PC_TYPES+=("run")
+        _PC_VALUES+=("$val")
+        _PC_DIRS+=("")
+        last_index=$((${#_PC_TYPES[@]} - 1))
+        continue
+      fi
+    fi
+  done <"$config"
+}
+
+action_symlink() {
+  local repo="$1" dest="$2" path="$3"
+  if [[ ! -e "$repo/$path" ]]; then
+    warn "symlink source not found: $repo/$path"
+    return 1
+  fi
+  if [[ -e "$dest/$path" ]]; then
+    return 0
+  fi
+  local parent
+  parent="$(dirname "$dest/$path")"
+  [[ -d "$parent" ]] || mkdir -p "$parent"
+  ln -sf "$repo/$path" "$dest/$path"
+}
+
+action_copy() {
+  local repo="$1" dest="$2" path="$3"
+  if [[ ! -e "$repo/$path" ]]; then
+    warn "copy source not found: $repo/$path"
+    return 1
+  fi
+  if [[ -e "$dest/$path" ]]; then
+    return 0
+  fi
+  local parent
+  parent="$(dirname "$dest/$path")"
+  [[ -d "$parent" ]] || mkdir -p "$parent"
+  cp -a "$repo/$path" "$dest/$path"
+}
+
+action_run() {
+  local dest="$1" cmd="$2" dir="${3:-.}"
+  local target="$dest/$dir"
+  if [[ ! -d "$target" ]]; then
+    warn "run directory not found: $target"
+    return 1
+  fi
+  if ! (cd "$target" && eval "$cmd"); then
+    warn "command failed: $cmd"
+    return 1
+  fi
+}
+
+run_post_create() {
+  local repo="$1" dest="$2"
+
+  if [[ "$_WT_CONFIG_LOADED" -eq 0 ]]; then
+    symlink_dotfiles "$repo" "$dest"
+    return
+  fi
+
+  local total=${#_PC_TYPES[@]}
+  if [[ "$total" -eq 0 ]]; then
+    return 0
+  fi
+
+  local ok=0 fail=0
+  for i in "${!_PC_TYPES[@]}"; do
+    local type="${_PC_TYPES[$i]}"
+    local value="${_PC_VALUES[$i]}"
+    local dir="${_PC_DIRS[$i]}"
+
+    case "$type" in
+      symlink)
+        if action_symlink "$repo" "$dest" "$value"; then
+          ok=$((ok + 1))
+        else
+          fail=$((fail + 1))
+        fi
+        ;;
+      copy)
+        if action_copy "$repo" "$dest" "$value"; then
+          ok=$((ok + 1))
+        else
+          fail=$((fail + 1))
+        fi
+        ;;
+      run)
+        printf '  %sRunning:%s %s\n' "$DIM" "$NC" "$value"
+        if action_run "$dest" "$value" "$dir"; then
+          ok=$((ok + 1))
+        else
+          fail=$((fail + 1))
+        fi
+        ;;
+    esac
+  done
+
+  if [[ "$fail" -gt 0 ]]; then
+    printf '  %spost_create: %d succeeded, %d failed%s\n' "$YELLOW" "$ok" "$fail" "$NC"
+  elif [[ "$ok" -gt 0 ]]; then
+    printf '  %spost_create: %d action(s) done%s\n' "$DIM" "$ok" "$NC"
+  fi
+}
+
 # --- Commands ---
 
 cmd_new() {
@@ -121,6 +320,7 @@ EOF
   [[ -z "$branch" ]] && die "branch name required. See: wt new --help"
 
   require_repo
+  load_config
   name="${name:-${branch##*/}}"
   local dest="$WT_TREES/$name"
 
@@ -167,10 +367,10 @@ EOF
   else
     info "Creating new branch from origin/master: $branch"
     git fetch origin master --quiet
-    git worktree add -b "$branch" "$dest" origin/master
+    git worktree add --no-track -b "$branch" "$dest" origin/master
   fi
 
-  symlink_dotfiles "$WT_REPO" "$dest"
+  run_post_create "$WT_REPO" "$dest"
   printf '\n'
   success "$dest"
   printf '  cd %s\n' "$dest"
@@ -257,6 +457,7 @@ EOF
   [[ -z "$old_path" ]] && die "path required. See: wt mv --help"
 
   require_repo
+  load_config
   old_path="$(cd "$old_path" 2>/dev/null && pwd)" || die "path does not exist: $old_path"
 
   local repo_abs
@@ -284,7 +485,7 @@ EOF
   printf '  To:   %s\n' "$dest"
   git worktree move "$old_path" "$dest"
 
-  symlink_dotfiles "$WT_REPO" "$dest"
+  run_post_create "$WT_REPO" "$dest"
   printf '\n'
   success "$dest"
   printf '  cd %s\n' "$dest"
@@ -646,6 +847,17 @@ ${BOLD}Config (env vars):${NC}
   WT_REPO    Main bare/checkout repo  (auto-detected from git)
   WT_TREES   Worktree directory       (default: sibling 'trees/' dir)
   WT_MAX     Max worktrees            (default: 15)
+
+${BOLD}Config file (wt.yml):${NC}
+  Place a wt.yml in your repo root to control post-create actions.
+  If present, auto-symlink of dotfiles is disabled.
+
+    trees: ../trees          # sets WT_TREES (env var takes precedence)
+    post_create:
+      - symlink: .envrc      # symlink a file/dir from main repo
+      - copy: .env.example   # copy a file/dir from main repo
+      - run: uv sync         # run a shell command in the new worktree
+        dir: subdir           # optional working directory for run
 
 Run 'wt <command> --help' for command-specific help.
 EOF

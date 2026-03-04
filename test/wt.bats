@@ -307,3 +307,177 @@ WT="$PROJECT_DIR/wt"
   assert_failure
   assert_output --partial "not a git repository"
 }
+
+# --- wt.yml config ---
+
+@test "wt.yml symlink creates link" {
+  setup_test_repo
+  setup_fake_origin
+
+  echo "direnv content" > "$WT_REPO/.envrc"
+  write_wt_config <<'EOF'
+post_create:
+  - symlink: .envrc
+EOF
+
+  run "$WT" new test/cfg-sym
+  assert_success
+  [ -L "$WT_TREES/cfg-sym/.envrc" ]
+}
+
+@test "wt.yml symlink handles nested paths" {
+  setup_test_repo
+  setup_fake_origin
+
+  mkdir -p "$WT_REPO/tod_project"
+  echo "nested" > "$WT_REPO/tod_project/.envrc"
+  write_wt_config <<'EOF'
+post_create:
+  - symlink: tod_project/.envrc
+EOF
+
+  run "$WT" new test/cfg-nested
+  assert_success
+  [ -L "$WT_TREES/cfg-nested/tod_project/.envrc" ]
+}
+
+@test "wt.yml copy copies file" {
+  setup_test_repo
+  setup_fake_origin
+
+  echo "SECRET=abc" > "$WT_REPO/.env.example"
+  write_wt_config <<'EOF'
+post_create:
+  - copy: .env.example
+EOF
+
+  run "$WT" new test/cfg-copy
+  assert_success
+  [ -f "$WT_TREES/cfg-copy/.env.example" ]
+  [ ! -L "$WT_TREES/cfg-copy/.env.example" ]
+  [ "$(cat "$WT_TREES/cfg-copy/.env.example")" = "SECRET=abc" ]
+}
+
+@test "wt.yml run executes command" {
+  setup_test_repo
+  setup_fake_origin
+
+  write_wt_config <<'EOF'
+post_create:
+  - run: touch marker
+EOF
+
+  run "$WT" new test/cfg-run
+  assert_success
+  [ -f "$WT_TREES/cfg-run/marker" ]
+}
+
+@test "wt.yml run with dir" {
+  setup_test_repo
+  setup_fake_origin
+
+  write_wt_config <<'EOF'
+post_create:
+  - run: touch marker
+    dir: subdir
+EOF
+
+  # Create subdir in repo so it exists in worktree checkout
+  mkdir -p "$WT_REPO/subdir"
+  touch "$WT_REPO/subdir/.gitkeep"
+  git -C "$WT_REPO" add subdir/.gitkeep
+  git -C "$WT_REPO" commit --quiet -m "add subdir"
+  git -C "$WT_REPO" push --quiet origin master
+
+  run "$WT" new test/cfg-rundir
+  assert_success
+  [ -f "$WT_TREES/cfg-rundir/subdir/marker" ]
+}
+
+@test "wt.yml trees overrides default" {
+  setup_test_repo
+  setup_fake_origin
+
+  local custom_trees="$BATS_TEST_TMPDIR/custom-trees"
+  write_wt_config <<EOF
+trees: $custom_trees
+post_create: []
+EOF
+
+  unset WT_TREES
+  run "$WT" new test/cfg-trees
+  assert_success
+  [ -d "$custom_trees/cfg-trees" ]
+}
+
+@test "wt.yml trees yields to env var" {
+  setup_test_repo
+  setup_fake_origin
+
+  local custom_trees="$BATS_TEST_TMPDIR/custom-trees"
+  write_wt_config <<EOF
+trees: $custom_trees
+post_create: []
+EOF
+
+  # WT_TREES is already set by setup_test_repo — it should take precedence
+  run "$WT" new test/cfg-envpri
+  assert_success
+  [ -d "$WT_TREES/cfg-envpri" ]
+  [ ! -d "$custom_trees/cfg-envpri" ]
+}
+
+@test "wt.yml disables auto-symlink" {
+  setup_test_repo
+  setup_fake_origin
+
+  echo "should not appear" > "$WT_REPO/.envrc"
+  write_wt_config <<'EOF'
+post_create: []
+EOF
+
+  run "$WT" new test/cfg-nosym
+  assert_success
+  [ ! -L "$WT_TREES/cfg-nosym/.envrc" ]
+}
+
+@test "no wt.yml preserves legacy behavior" {
+  setup_test_repo
+  setup_fake_origin
+
+  echo "legacy" > "$WT_REPO/.envrc"
+  # No wt.yml — should auto-symlink
+  run "$WT" new test/legacy-dots
+  assert_success
+  [ -L "$WT_TREES/legacy-dots/.envrc" ]
+}
+
+@test "wt.yml warns on missing source" {
+  setup_test_repo
+  setup_fake_origin
+
+  write_wt_config <<'EOF'
+post_create:
+  - symlink: .nonexistent
+EOF
+
+  run "$WT" new test/cfg-miss
+  assert_success
+  assert_output --partial "warning:"
+  assert_output --partial "not found"
+}
+
+@test "wt.yml run failure is non-fatal" {
+  setup_test_repo
+  setup_fake_origin
+
+  write_wt_config <<'EOF'
+post_create:
+  - run: false
+  - run: touch survived
+EOF
+
+  run "$WT" new test/cfg-failrun
+  assert_success
+  [ -f "$WT_TREES/cfg-failrun/survived" ]
+}

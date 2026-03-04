@@ -24,6 +24,11 @@ setup_test_repo() {
   git -C "$WT_REPO" commit --quiet -m "init"
 }
 
+# Write a wt.yml config file to the test repo (pass content via stdin)
+write_wt_config() {
+  cat > "$WT_REPO/wt.yml"
+}
+
 # Create a fake "origin/master" so branch operations work
 setup_fake_origin() {
   local bare="$BATS_TEST_TMPDIR/origin.git"
