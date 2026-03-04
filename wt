@@ -491,6 +491,50 @@ EOF
   printf '  cd %s\n' "$dest"
 }
 
+cmd_post_init() {
+  local name=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h | --help)
+        cat <<EOF
+Usage: wt post_init <name>
+
+Apply post-create actions (symlinks, copies, commands) to an existing worktree.
+Useful for worktrees created by other means (e.g. plain git worktree add).
+Symlinks and copies are idempotent — existing files are skipped.
+
+Examples:
+  wt post_init my-feature
+EOF
+        return 0
+        ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+
+  [[ -z "$name" ]] && die "name required. See: wt post_init --help"
+
+  require_repo
+  load_config
+
+  local dest="$WT_TREES/$name"
+  if [[ ! -d "$dest" ]]; then
+    local match
+    match="$(find "$WT_TREES" -mindepth 1 -maxdepth 1 -type d -name "*${name}*" 2>/dev/null | head -1)"
+    if [[ -n "$match" ]]; then
+      dest="$match"
+    else
+      die "no worktree matching: $name"
+    fi
+  fi
+
+  info "Applying post_create to: $dest"
+  run_post_create "$WT_REPO" "$dest"
+  success "post_init complete"
+}
+
 cmd_path() {
   local name=""
 
@@ -632,7 +676,7 @@ cmd_shell() {
       cat <<EOF
 Usage: eval "\$(wt shell zsh)" or eval "\$(wt shell bash)"
 
-Enables 'wt cd' and tab completions in your current shell.
+Enables 'wt cd', auto-cd after 'wt new', and tab completions.
 
 Add to your rc file:
   zsh:  eval "\$(wt shell zsh)"
@@ -685,6 +729,25 @@ wt() {
         return 1
       fi
       ;;
+    new)
+      command wt "$@" || return
+      shift
+      local _branch="" _name=""
+      for _arg in "$@"; do
+        case "$_arg" in
+          -h|--help) return 0 ;;
+          *) [[ -z "$_branch" ]] && _branch="$_arg" || _name="$_arg" ;;
+        esac
+      done
+      _name="${_name:-${_branch##*/}}"
+      local trees="${WT_TREES:-}"
+      if [[ -z "$trees" ]]; then
+        local repo
+        repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+        [[ -n "$repo" ]] && trees="$(dirname "$repo")/trees"
+      fi
+      [[ -n "$trees" && -n "$_name" && -d "$trees/$_name" ]] && builtin cd "$trees/$_name"
+      ;;
     *) command wt "$@" ;;
   esac
 }
@@ -696,6 +759,7 @@ _wt() {
     'rm:Remove a worktree'
     'mv:Move an existing worktree'
     'cd:Change directory to a worktree'
+    'post_init:Apply post-create actions to an existing worktree'
     'path:Print worktree path'
     'ls:List worktrees and recent branches'
     'shell:Print shell integration code'
@@ -712,7 +776,7 @@ _wt() {
         [[ -n "$repo" ]] && trees="$(dirname "$repo")/trees"
       fi
       case "${words[2]}" in
-        cd|rm|path)
+        cd|rm|path|post_init)
           local -a treelist
           if [[ -n "$trees" && -d "$trees" ]]; then
             treelist=(${(f)"$(command ls -1 "$trees" 2>/dev/null)"})
@@ -775,6 +839,25 @@ wt() {
         return 1
       fi
       ;;
+    new)
+      command wt "$@" || return
+      shift
+      local _branch="" _name=""
+      for _arg in "$@"; do
+        case "$_arg" in
+          -h|--help) return 0 ;;
+          *) [[ -z "$_branch" ]] && _branch="$_arg" || _name="$_arg" ;;
+        esac
+      done
+      _name="${_name:-${_branch##*/}}"
+      local trees="${WT_TREES:-}"
+      if [[ -z "$trees" ]]; then
+        local repo
+        repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+        [[ -n "$repo" ]] && trees="$(dirname "$repo")/trees"
+      fi
+      [[ -n "$trees" && -n "$_name" && -d "$trees/$_name" ]] && builtin cd "$trees/$_name"
+      ;;
     *) command wt "$@" ;;
   esac
 }
@@ -783,7 +866,7 @@ _wt_completions() {
   local cur prev commands
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="new rm mv cd path ls shell help"
+  commands="new rm mv cd post_init path ls shell help"
 
   if [[ ${COMP_CWORD} -eq 1 ]]; then
     COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -798,7 +881,7 @@ _wt_completions() {
   fi
 
   case "${COMP_WORDS[1]}" in
-    cd|rm|path)
+    cd|rm|path|post_init)
       if [[ -n "$trees" && -d "$trees" ]]; then
         COMPREPLY=($(compgen -W "$(command ls -1 "$trees" 2>/dev/null)" -- "$cur"))
       fi
@@ -832,6 +915,7 @@ ${BOLD}Commands:${NC}
   rm <name>              Remove a worktree (prompts for branch deletion)
   mv <path> [name]       Move an existing worktree into trees/
   cd <name>              Change directory to a worktree (needs shell integration)
+  post_init <name>       Apply post-create actions to an existing worktree
   ls [days]              List worktrees and recent branches (default: 14d)
   path <name>            Print worktree path (supports fuzzy match)
   shell <zsh|bash>       Print shell integration code
@@ -879,6 +963,10 @@ case "${1:---help}" in
     cmd_mv "$@"
     ;;
   cd) die "'wt cd' requires shell integration. Run: wt shell --help" ;;
+  post_init)
+    shift
+    cmd_post_init "$@"
+    ;;
   path)
     shift
     cmd_path "$@"
