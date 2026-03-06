@@ -2,6 +2,12 @@
 
 A simple git worktree manager for organised branch workflows.
 
+> [!IMPORTANT]
+> You may want to consider using one of these more established tools - they're both excellent.
+> I've incorporated ideas from these tools into wt, mostly to tailor it to my personal preferences.
+> - [git-wt](https://github.com/k1LoW/git-wt)
+> - [wtp](https://github.com/satococoa/wtp)
+
 Keep your worktrees in one place, switch between them quickly, and see what's going on at a glance.
 
 ## Install
@@ -20,7 +26,7 @@ Make sure `~/.local/bin` is in your `PATH`.
 
 ### Shell integration
 
-Add to your rc file for `wt cd` and tab completions:
+Add to your rc file for `wt cd`, auto-cd after `wt new`, and tab completions:
 
 ```sh
 # ~/.zshrc
@@ -37,6 +43,7 @@ wt new <branch> [name]    Create a worktree (or move if already checked out)
 wt rm <name>              Remove a worktree (prompts for branch deletion)
 wt mv <path> [name]       Move an existing worktree into trees/
 wt cd <name>              cd to a worktree (needs shell integration)
+wt post_init <name>       Apply post-create actions to an existing worktree
 wt ls [days]              List worktrees and recent branches (default: 14d)
 wt path <name>            Print worktree path (supports fuzzy match)
 wt help                   Show help
@@ -87,7 +94,7 @@ Colour-coded: green for ahead, red for behind, yellow for uncommitted changes, m
 
 ## Configuration
 
-All config is via environment variables:
+### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -95,10 +102,53 @@ All config is via environment variables:
 | `WT_TREES` | Sibling `trees/` dir | Where worktrees are created |
 | `WT_MAX` | `15` | Maximum number of worktrees |
 
+### Config file (`wt.yml`)
+
+Place a `wt.yml` in your repo root to control what happens after a worktree is created (via `wt new` or `wt mv`). If present, the default dotfile symlinking is disabled — you get explicit control instead.
+
+```yaml
+# Optional: override the trees directory (env var takes precedence)
+trees: ../trees
+
+post_create:
+  - symlink: .envrc           # symlink a file/dir from the main repo
+  - symlink: .vscode/settings.json  # nested paths work too
+  - copy: .env.example        # copy a file/dir (not a link)
+  - run: npm install           # run a shell command in the worktree
+  - run: uv sync
+    dir: backend               # optional working directory for run
+```
+
+**Actions:**
+
+| Action | Behaviour |
+|--------|-----------|
+| `symlink: <path>` | Create a symlink from the main repo to the worktree. Skipped if the destination already exists. |
+| `copy: <path>` | Copy a file or directory from the main repo. Skipped if the destination already exists. |
+| `run: <command>` | Run a shell command inside the worktree. Optional `dir:` sets the working directory (default: worktree root). |
+
+**Notes:**
+
+- Without a `wt.yml`, untracked dotfiles are automatically symlinked (legacy behaviour).
+- With a `wt.yml` but an empty `post_create:`, nothing runs.
+- Symlink and copy actions are idempotent — safe to re-run via `wt post_init`.
+- Run actions always re-execute (useful for `npm install`, `uv sync`, etc.).
+- Failed actions are non-fatal — other actions still run, and a summary is printed.
+
+### Applying post-create to existing worktrees
+
+If a worktree was created by other means (e.g. `git worktree add`), you can apply the `post_create` actions after the fact:
+
+```sh
+wt post_init my-feature
+```
+
+This is idempotent — symlinks and copies that already exist are skipped.
+
 ## Features
 
 - **Auto-detection** — works without config if you're inside a git repo
-- **Dotfile symlinking** — untracked dotfiles (`.envrc`, `.venv`, `.vscode`, etc.) are automatically symlinked into new worktrees
+- **Post-create hooks** — configure symlinks, file copies, and shell commands via `wt.yml` (falls back to auto-symlinking untracked dotfiles)
 - **Conflict handling** — if a branch is already checked out elsewhere, offers to move it
 - **Fuzzy matching** — `wt cd` and `wt path` match by substring
 - **Safe removal** — warns about uncommitted changes, prompts before deleting branches
