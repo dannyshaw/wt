@@ -245,6 +245,39 @@ WT="$PROJECT_DIR/wt"
   assert_output --partial "RECENT BRANCHES"
 }
 
+@test "ls handles broken worktree with own .git directory" {
+  setup_test_repo
+  setup_fake_origin
+
+  "$WT" new test/good-wt
+  "$WT" new test/bad-wt
+
+  # Corrupt bad-wt by replacing its .git file with a .git directory
+  rm "$WT_TREES/bad-wt/.git"
+  mkdir "$WT_TREES/bad-wt/.git"
+
+  run "$WT" ls
+  assert_success
+  assert_output --partial "WORKTREES"
+  assert_output --partial "good-wt"
+  assert_output --partial "not a linked worktree"
+}
+
+@test "ls handles missing worktree path" {
+  setup_test_repo
+  setup_fake_origin
+
+  "$WT" new test/will-vanish
+
+  # Remove the worktree directory out from under git
+  rm -rf "$WT_TREES/will-vanish"
+
+  run "$WT" ls
+  assert_success
+  assert_output --partial "WORKTREES"
+  assert_output --partial "missing path"
+}
+
 @test "mv moves a worktree" {
   setup_test_repo
   setup_fake_origin
@@ -260,42 +293,17 @@ WT="$PROJECT_DIR/wt"
   [ ! -d "$outside" ]
 }
 
-# --- Dotfile symlinking ---
+# --- No auto-symlink without wt.yml ---
 
-@test "new symlinks untracked dotfiles" {
+@test "new does not auto-symlink without wt.yml" {
   setup_test_repo
   setup_fake_origin
 
-  # Create an untracked dotfile in the repo
   echo "test" > "$WT_REPO/.envrc"
 
-  run "$WT" new test/with-dots
+  run "$WT" new test/no-auto-sym
   assert_success
-  [ -L "$WT_TREES/with-dots/.envrc" ]
-}
-
-@test "new does not symlink git-tracked dotfiles" {
-  setup_test_repo
-  setup_fake_origin
-
-  echo "tracked" > "$WT_REPO/.tracked"
-  git -C "$WT_REPO" add .tracked
-  git -C "$WT_REPO" commit --quiet -m "add tracked dotfile"
-  # Update origin so new branch works
-  git -C "$WT_REPO" push --quiet origin master
-
-  run "$WT" new test/no-tracked-dots
-  assert_success
-  [ ! -L "$WT_TREES/no-tracked-dots/.tracked" ]
-}
-
-@test "new does not symlink .git" {
-  setup_test_repo
-  setup_fake_origin
-
-  run "$WT" new test/no-dotgit
-  assert_success
-  [ ! -L "$WT_TREES/no-dotgit/.git" ]
+  [ ! -L "$WT_TREES/no-auto-sym/.envrc" ]
 }
 
 # --- Config ---
@@ -427,7 +435,7 @@ EOF
   [ ! -d "$custom_trees/cfg-envpri" ]
 }
 
-@test "wt.yml disables auto-symlink" {
+@test "wt.yml empty post_create does nothing" {
   setup_test_repo
   setup_fake_origin
 
@@ -439,17 +447,6 @@ EOF
   run "$WT" new test/cfg-nosym
   assert_success
   [ ! -L "$WT_TREES/cfg-nosym/.envrc" ]
-}
-
-@test "no wt.yml preserves legacy behavior" {
-  setup_test_repo
-  setup_fake_origin
-
-  echo "legacy" > "$WT_REPO/.envrc"
-  # No wt.yml — should auto-symlink
-  run "$WT" new test/legacy-dots
-  assert_success
-  [ -L "$WT_TREES/legacy-dots/.envrc" ]
 }
 
 @test "wt.yml warns on missing source" {
@@ -480,4 +477,96 @@ EOF
   run "$WT" new test/cfg-failrun
   assert_success
   [ -f "$WT_TREES/cfg-failrun/survived" ]
+}
+
+@test "wt.yml fallback works" {
+  setup_test_repo
+  setup_fake_origin
+
+  echo "legacy" >"$WT_REPO/.envrc"
+  cat >"$WT_REPO/wt.yml" <<'EOF'
+post_create:
+  - symlink: .envrc
+EOF
+
+  run "$WT" new test/legacy-yml
+  assert_success
+  [ -L "$WT_TREES/legacy-yml/.envrc" ]
+}
+
+@test ".wt.yml takes precedence over wt.yml" {
+  setup_test_repo
+  setup_fake_origin
+
+  echo "data" >"$WT_REPO/.envrc"
+  echo "extra" >"$WT_REPO/.extra"
+
+  # wt.yml symlinks .extra, .wt.yml symlinks .envrc
+  cat >"$WT_REPO/wt.yml" <<'EOF'
+post_create:
+  - symlink: .extra
+EOF
+  write_wt_config <<'EOF'
+post_create:
+  - symlink: .envrc
+EOF
+
+  run "$WT" new test/precedence
+  assert_success
+  [ -L "$WT_TREES/precedence/.envrc" ]
+  [ ! -L "$WT_TREES/precedence/.extra" ]
+}
+
+@test "global ~/.wt.yml works with repo-scoped section" {
+  setup_test_repo
+  setup_fake_origin
+
+  echo "data" >"$WT_REPO/.envrc"
+
+  # Use fake HOME so we don't touch real ~/.wt.yml
+  local real_home="$HOME"
+  export HOME="$BATS_TEST_TMPDIR/fakehome"
+  mkdir -p "$HOME"
+
+  cat >"$HOME/.wt.yml" <<EOF
+${WT_REPO}:
+  post_create:
+    - symlink: .envrc
+EOF
+
+  run "$WT" new test/global-cfg
+  export HOME="$real_home"
+  assert_success
+  [ -L "$WT_TREES/global-cfg/.envrc" ]
+}
+
+@test "per-repo .wt.yml takes precedence over global ~/.wt.yml" {
+  setup_test_repo
+  setup_fake_origin
+
+  echo "data" >"$WT_REPO/.envrc"
+  echo "extra" >"$WT_REPO/.extra"
+
+  local real_home="$HOME"
+  export HOME="$BATS_TEST_TMPDIR/fakehome"
+  mkdir -p "$HOME"
+
+  # Global says symlink .extra
+  cat >"$HOME/.wt.yml" <<EOF
+${WT_REPO}:
+  post_create:
+    - symlink: .extra
+EOF
+
+  # Per-repo says symlink .envrc
+  write_wt_config <<'EOF'
+post_create:
+  - symlink: .envrc
+EOF
+
+  run "$WT" new test/local-wins
+  export HOME="$real_home"
+  assert_success
+  [ -L "$WT_TREES/local-wins/.envrc" ]
+  [ ! -L "$WT_TREES/local-wins/.extra" ]
 }

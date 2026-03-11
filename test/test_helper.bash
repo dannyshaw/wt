@@ -24,9 +24,14 @@ setup_test_repo() {
   git -C "$WT_REPO" commit --quiet -m "init"
 }
 
-# Write a wt.yml config file to the test repo (pass content via stdin)
+# Write a .wt.yml config file to the test repo (pass content via stdin)
 write_wt_config() {
-  cat > "$WT_REPO/wt.yml"
+  cat >"$WT_REPO/.wt.yml"
+}
+
+# Write a global ~/.wt.yml config file (pass content via stdin)
+write_global_config() {
+  cat >"$HOME/.wt.yml"
 }
 
 # Create a fake "origin/master" so branch operations work

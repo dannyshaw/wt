@@ -102,9 +102,19 @@ Colour-coded: green for ahead, red for behind, yellow for uncommitted changes, m
 | `WT_TREES` | Sibling `trees/` dir | Where worktrees are created |
 | `WT_MAX` | `15` | Maximum number of worktrees |
 
-### Config file (`wt.yml`)
+### Config file (`.wt.yml`)
 
-Place a `wt.yml` in your repo root to control what happens after a worktree is created (via `wt new` or `wt mv`). If present, the default dotfile symlinking is disabled — you get explicit control instead.
+Config is looked up in order:
+
+1. `.wt.yml` in repo root
+2. `wt.yml` in repo root (backwards compatibility)
+3. `~/.wt.yml` (global, scoped by repo path)
+
+The first match wins. Without any config, no post-create actions run.
+
+#### Per-repo config
+
+Place a `.wt.yml` in your repo root to control what happens after a worktree is created (via `wt new` or `wt mv`).
 
 ```yaml
 # Optional: override the trees directory (env var takes precedence)
@@ -119,7 +129,23 @@ post_create:
     dir: backend               # optional working directory for run
 ```
 
-**Actions:**
+#### Global config (`~/.wt.yml`)
+
+For repos you don't control (or to keep config out of the repo), use `~/.wt.yml` with sections scoped by the repo's absolute path:
+
+```yaml
+/Users/danny/dev/edrolo/edrolo:
+  post_create:
+    - symlink: .envrc
+    - run: npm install
+
+/Users/danny/dev/other/project:
+  trees: ../worktrees
+  post_create:
+    - run: uv sync
+```
+
+#### Actions
 
 | Action | Behaviour |
 |--------|-----------|
@@ -129,8 +155,6 @@ post_create:
 
 **Notes:**
 
-- Without a `wt.yml`, untracked dotfiles are automatically symlinked (legacy behaviour).
-- With a `wt.yml` but an empty `post_create:`, nothing runs.
 - Symlink and copy actions are idempotent — safe to re-run via `wt post_init`.
 - Run actions always re-execute (useful for `npm install`, `uv sync`, etc.).
 - Failed actions are non-fatal — other actions still run, and a summary is printed.
@@ -148,7 +172,7 @@ This is idempotent — symlinks and copies that already exist are skipped.
 ## Features
 
 - **Auto-detection** — works without config if you're inside a git repo
-- **Post-create hooks** — configure symlinks, file copies, and shell commands via `wt.yml` (falls back to auto-symlinking untracked dotfiles)
+- **Post-create hooks** — configure symlinks, file copies, and shell commands via `wt.yml`
 - **Conflict handling** — if a branch is already checked out elsewhere, offers to move it
 - **Fuzzy matching** — `wt cd` and `wt path` match by substring
 - **Safe removal** — warns about uncommitted changes, prompts before deleting branches

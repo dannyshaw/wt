@@ -55,40 +55,6 @@ require_repo() {
   [[ -n "$WT_TREES" ]] || die "WT_TREES is not set"
 }
 
-symlink_dotfiles() {
-  local src="$1" dest="$2" count=0
-
-  for item in "$src"/.*; do
-    [[ -e "$item" ]] || continue
-    local base
-    base="$(basename "$item")"
-
-    case "$base" in
-      . | .. | .git | .DS_Store) continue ;;
-      *cache*) continue ;;
-    esac
-
-    # Skip git-tracked files
-    if [[ -f "$item" ]]; then
-      git -C "$src" ls-files --error-unmatch "$base" &>/dev/null && continue
-    elif [[ -d "$item" ]]; then
-      local tracked
-      tracked="$(git -C "$src" ls-files "$base/" 2>/dev/null | head -1)"
-      [[ -n "$tracked" ]] && continue
-    fi
-
-    # Don't overwrite
-    [[ -e "$dest/$base" ]] && continue
-
-    ln -sf "$item" "$dest/$base"
-    count=$((count + 1))
-  done
-
-  if [[ "$count" -gt 0 ]]; then
-    printf '  %sSymlinked %d dotfile(s)%s\n' "$DIM" "$count" "$NC"
-  fi
-}
-
 # --- Config file (wt.yml) ---
 
 _WT_CONFIG_LOADED=0
@@ -96,16 +62,7 @@ _PC_TYPES=()
 _PC_VALUES=()
 _PC_DIRS=()
 
-load_config() {
-  local config="$WT_REPO/wt.yml"
-  _WT_CONFIG_LOADED=0
-  _PC_TYPES=()
-  _PC_VALUES=()
-  _PC_DIRS=()
-
-  [[ -f "$config" ]] || return 0
-  _WT_CONFIG_LOADED=1
-
+_parse_config() {
   local in_post_create=0
   local last_index=-1
 
@@ -189,7 +146,50 @@ load_config() {
         continue
       fi
     fi
-  done <"$config"
+  done
+}
+
+_extract_repo_section() {
+  local file="$1" repo="$2"
+  local in_section=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$in_section" -eq 1 ]]; then
+      # Blank lines — keep in section
+      [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+      # Non-indented line — new section, stop
+      [[ ! "$line" =~ ^[[:space:]] ]] && break
+      # Strip 2 spaces of indentation
+      echo "${line#  }"
+    fi
+
+    if [[ "$line" == "${repo}:" ]]; then
+      in_section=1
+    fi
+  done <"$file"
+}
+
+load_config() {
+  _WT_CONFIG_LOADED=0
+  _PC_TYPES=()
+  _PC_VALUES=()
+  _PC_DIRS=()
+
+  # .wt.yml > wt.yml (per-repo), then ~/.wt.yml (global, repo-scoped)
+  if [[ -f "$WT_REPO/.wt.yml" ]]; then
+    _WT_CONFIG_LOADED=1
+    _parse_config <"$WT_REPO/.wt.yml"
+  elif [[ -f "$WT_REPO/wt.yml" ]]; then
+    _WT_CONFIG_LOADED=1
+    _parse_config <"$WT_REPO/wt.yml"
+  elif [[ -f "$HOME/.wt.yml" ]]; then
+    local section
+    section="$(_extract_repo_section "$HOME/.wt.yml" "$WT_REPO")"
+    if [[ -n "$section" ]]; then
+      _WT_CONFIG_LOADED=1
+      _parse_config <<<"$section"
+    fi
+  fi
 }
 
 action_symlink() {
@@ -239,8 +239,7 @@ run_post_create() {
   local repo="$1" dest="$2"
 
   if [[ "$_WT_CONFIG_LOADED" -eq 0 ]]; then
-    symlink_dotfiles "$repo" "$dest"
-    return
+    return 0
   fi
 
   local total=${#_PC_TYPES[@]}
@@ -590,6 +589,35 @@ cmd_ls() {
     path="$(echo "$line" | awk '{print $1}')"
     branch="$(echo "$line" | awk '{print $3}' | tr -d '[]')"
 
+    # Skip entries with missing path or invalid branch
+    if [[ -z "$path" ]]; then
+      continue
+    fi
+
+    # Detect broken worktrees (missing dir, not a git repo, has own .git dir instead of file)
+    if [[ ! -d "$path" ]]; then
+      printf "  ${BOLD}${RED}%-42s${NC} %s\n" "${branch:-???}" "(missing path)"
+      printf "  ${DIM}%s${NC}\n" "${path/#$HOME/~}"
+      continue
+    fi
+    if [[ -d "$path/.git" && ! -f "$path/.git" ]] && [[ "$path" != "$WT_REPO" ]]; then
+      printf "  ${BOLD}${RED}%-42s${NC} %s\n" "${branch:-???}" "(not a linked worktree — has own .git directory)"
+      printf "  ${DIM}%s${NC}\n" "${path/#$HOME/~}"
+      continue
+    fi
+    if ! git -C "$path" rev-parse --git-dir &>/dev/null; then
+      printf "  ${BOLD}${RED}%-42s${NC} %s\n" "${branch:-???}" "(broken worktree)"
+      printf "  ${DIM}%s${NC}\n" "${path/#$HOME/~}"
+      continue
+    fi
+
+    # Handle detached HEAD or missing branch info
+    if [[ -z "$branch" || "$branch" == "(error)" ]]; then
+      printf "  ${BOLD}${RED}%-42s${NC} %s\n" "(unknown branch)" "(error reading worktree)"
+      printf "  ${DIM}%s${NC}\n" "${path/#$HOME/~}"
+      continue
+    fi
+
     ahead="$(git rev-list --count "origin/master..$branch" 2>/dev/null || echo '?')"
     behind="$(git rev-list --count "$branch..origin/master" 2>/dev/null || echo '?')"
 
@@ -605,7 +633,8 @@ cmd_ls() {
     local dirty=""
     if [[ -d "$path" ]]; then
       local changes
-      changes="$(git -C "$path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+      changes="$(git -C "$path" status --porcelain 2>/dev/null || true)"
+      changes="$(echo "$changes" | grep -c . 2>/dev/null || echo 0)"
       [[ "$changes" -gt 0 ]] && dirty=" ${YELLOW}(${changes} uncommitted)${NC}"
     fi
 
@@ -932,16 +961,22 @@ ${BOLD}Config (env vars):${NC}
   WT_TREES   Worktree directory       (default: sibling 'trees/' dir)
   WT_MAX     Max worktrees            (default: 15)
 
-${BOLD}Config file (wt.yml):${NC}
-  Place a wt.yml in your repo root to control post-create actions.
-  If present, auto-symlink of dotfiles is disabled.
+${BOLD}Config file (.wt.yml):${NC}
+  Looked up in order: .wt.yml > wt.yml (in repo root), then ~/.wt.yml (global).
 
+  Per-repo (.wt.yml in repo root):
     trees: ../trees          # sets WT_TREES (env var takes precedence)
     post_create:
       - symlink: .envrc      # symlink a file/dir from main repo
       - copy: .env.example   # copy a file/dir from main repo
       - run: uv sync         # run a shell command in the new worktree
         dir: subdir           # optional working directory for run
+
+  Global (~/.wt.yml, scoped by repo path):
+    /Users/you/dev/project:
+      post_create:
+        - symlink: .envrc
+        - run: npm install
 
 Run 'wt <command> --help' for command-specific help.
 EOF
